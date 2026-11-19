@@ -1,0 +1,16 @@
+node_modules/
+kit/
+scratch/
+transcripts.tar.gz
+*.tar.gz
+*.html
+competition.json
+feed.json
+heartbeat.md
+kit_meta.json
+leaderboard.json
+llms.txt
+requirements.json
+skill.md
+ai-catalog.json
+check_*.ts
