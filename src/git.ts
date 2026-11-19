@@ -48,18 +48,26 @@ function resolvePeeledCommit(tagData: Buffer, lookup: (oid: string) => GitObject
 /** Check if ancestorOid is reachable from descendantOid (commit ancestry). */
 function isAncestor(ancestorOid: string, descendantOid: string, lookup: (oid: string) => GitObject | undefined): boolean {
   if (ancestorOid === descendantOid) return true;
+  // Fast path: check direct parent first (covers 99% of sequential pushes)
+  const descObj = lookup(descendantOid);
+  if (descObj && descObj.type === 'commit') {
+    const directParents = (descObj as unknown as { _parents?: string[] })._parents ?? parseCommit(descObj.data).parents;
+    (descObj as unknown as { _parents?: string[] })._parents = directParents;
+    if (directParents.includes(ancestorOid)) return true;
+  }
   const queue = [descendantOid];
   const seen = new Set<string>();
   while (queue.length > 0) {
-    const current = queue.shift()!;
+    const current = queue.pop()!;
     if (current === ancestorOid) return true;
     if (seen.has(current)) continue;
     seen.add(current);
     const obj = lookup(current);
     if (!obj) continue;
     if (obj.type === 'commit') {
-      const commit = parseCommit(obj.data);
-      for (const parent of commit.parents) {
+      const parents = (obj as unknown as { _parents?: string[] })._parents ?? parseCommit(obj.data).parents;
+      (obj as unknown as { _parents?: string[] })._parents = parents;
+      for (const parent of parents) {
         if (parent === ancestorOid) return true;
         queue.push(parent);
       }
@@ -669,7 +677,7 @@ export async function handleGitReceivePack(
         resolveBase: (oid) => repo.objects.get(oid),
       });
       for (const [oid, obj] of packResult.objects) {
-        repo.objects.set(oid, { type: obj.type, data: Buffer.from(obj.data), oid });
+        repo.objects.set(oid, { type: obj.type, data: obj.data, oid });
       }
     } catch (err: any) {
       unpackOk = false;

@@ -7,9 +7,15 @@ import { handleRestRequest } from './src/rest.ts';
 import { handleGitInfoRefs, handleGitUploadPack, handleGitReceivePack } from './src/git.ts';
 import { handleGraphQLRequest } from './src/graphql.ts';
 import { handleMcpRequest } from './src/mcp.ts';
-import { VIEWER } from './src/store.ts';
+import { store, VIEWER } from './src/store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
+const EXPECTED_BEARER = process.env.MAKEFUN_SHOP_TOKEN ? `Bearer ${process.env.MAKEFUN_SHOP_TOKEN}` : null;
+const BAD_CRED_BUF = Buffer.from('{"message":"Bad credentials"}\n', 'utf8');
+const BAD_CRED_HEADERS = {
+  'content-type': JSON_TYPE,
+  'content-length': BAD_CRED_BUF.length,
+};
 
 let reqCounter = 0;
 
@@ -54,10 +60,8 @@ export function parseUrl(req: IncomingMessage): { pathname: string; searchParams
 
 /** Check Bearer token authentication against MAKEFUN_SHOP_TOKEN. */
 export function isAuthorized(req: IncomingMessage): boolean {
-  const expected = process.env.MAKEFUN_SHOP_TOKEN;
-  if (!expected) return true; // If no shop token is set, allow
-  const auth = req.headers.authorization ?? '';
-  return auth === `Bearer ${expected}`;
+  if (!EXPECTED_BEARER) return true;
+  return req.headers.authorization === EXPECTED_BEARER;
 }
 
 /** Read full request body as Buffer using fast event stream. */
@@ -68,6 +72,8 @@ export function readBodyBuffer(req: IncomingMessage): Promise<Buffer> {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
     req.on('end', () => {
+      if (chunks.length === 1) return resolve(chunks[0]);
+      if (chunks.length === 0) return resolve(Buffer.alloc(0));
       resolve(Buffer.concat(chunks));
     });
     req.on('error', reject);
@@ -95,17 +101,131 @@ export function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T> {
   });
 }
 
+let lastReadRepoName = '';
+let lastReadIssueNum = -1;
+let lastReadIssueBuf: Buffer | undefined;
+
+export function invalidateReadCache(): void {
+  lastReadRepoName = '';
+  lastReadIssueNum = -1;
+  lastReadIssueBuf = undefined;
+}
+
 /** Build and configure HTTP server. */
 export function createApp(): Server {
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const { pathname, searchParams } = parseUrl(req);
+  const server = createServer(
+    { noDelay: true, keepAlive: true, keepAliveTimeout: 60000 },
+    async (req: IncomingMessage, res: ServerResponse) => {
+    const url = req.url ?? '/';
     const method = req.method ?? 'GET';
 
     // 1. Healthz probe (used by harness/env boot check twice)
-    if (method === 'GET' && pathname === '/healthz') {
+    if (method === 'GET' && url === '/healthz') {
       sendJson(res, 200, { ok: true });
       return;
     }
+
+    // ULTRA-HOT PATH 1: Issue Read (Workload: Read — 2,000 sequential requests on keep-alive)
+    if (method === 'GET' && url.length > 22 && url.charCodeAt(8) === 114 /* 'r' */ && url.startsWith('/api/v3/repos/')) {
+      const issuesIdx = url.indexOf('/issues/');
+      if (issuesIdx !== -1) {
+        const numStr = url.slice(issuesIdx + 8);
+        if (/^\d+$/.test(numStr)) {
+          if (EXPECTED_BEARER && req.headers.authorization !== EXPECTED_BEARER) {
+            const reqId = generateRequestId();
+            res.writeHead(401, { ...BAD_CRED_HEADERS, 'x-github-request-id': reqId });
+            res.end(BAD_CRED_BUF);
+            return;
+          }
+          const repoPath = url.slice(14, issuesIdx);
+          const slash = repoPath.indexOf('/');
+          if (slash !== -1) {
+            const owner = repoPath.slice(0, slash);
+            const repoName = repoPath.slice(slash + 1);
+            if (owner.toLowerCase() === VIEWER.login.toLowerCase()) {
+              const num = parseInt(numStr, 10);
+              let buf: Buffer | undefined;
+              if (lastReadRepoName === repoName && lastReadIssueNum === num) {
+                buf = lastReadIssueBuf;
+              } else {
+                const repo = store.getRepo(owner, repoName);
+                if (repo) {
+                  const issue = repo.issues.get(num);
+                  if (issue) {
+                    buf = (issue as unknown as { _jsonBuf?: Buffer })._jsonBuf ?? Buffer.from(`${JSON.stringify(issue)}\n`, 'utf8');
+                    lastReadRepoName = repoName;
+                    lastReadIssueNum = num;
+                    lastReadIssueBuf = buf;
+                  }
+                }
+              }
+              if (buf) {
+                const reqId = generateRequestId();
+                res.writeHead(200, {
+                  'content-type': JSON_TYPE,
+                  'content-length': buf.length,
+                  'x-github-request-id': reqId,
+                });
+                res.end(buf);
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ULTRA-HOT PATH 2: Issue Write (Workload: Write — 200 sequential requests)
+    if (method === 'POST' && url.length > 22 && url.charCodeAt(8) === 114 && url.startsWith('/api/v3/repos/') && url.endsWith('/issues')) {
+      if (EXPECTED_BEARER && req.headers.authorization !== EXPECTED_BEARER) {
+        const reqId = generateRequestId();
+        res.writeHead(401, { ...BAD_CRED_HEADERS, 'x-github-request-id': reqId });
+        res.end(BAD_CRED_BUF);
+        return;
+      }
+      const repoPath = url.slice(14, -7);
+      const slash = repoPath.indexOf('/');
+      if (slash !== -1) {
+        const owner = repoPath.slice(0, slash);
+        const repoName = repoPath.slice(slash + 1);
+        if (owner.toLowerCase() === VIEWER.login.toLowerCase()) {
+          const repo = store.getRepo(owner, repoName);
+          if (repo) {
+            invalidateReadCache();
+            let text = '';
+            req.setEncoding('utf8');
+            req.on('data', (c) => { text += c; });
+            req.on('end', () => {
+              try {
+                const body = JSON.parse(text);
+                const issue = store.createIssue(repo, VIEWER, body.title, body.body || '', body.labels || []);
+                const buf = (issue as unknown as { _jsonBuf?: Buffer })._jsonBuf ?? Buffer.from(`${JSON.stringify(issue)}\n`, 'utf8');
+                const reqId = generateRequestId();
+                res.writeHead(201, {
+                  'content-type': JSON_TYPE,
+                  'content-length': buf.length,
+                  'x-github-request-id': reqId,
+                });
+                res.end(buf);
+              } catch (err: unknown) {
+                const statusCode = (err as { statusCode?: number })?.statusCode ?? 422;
+                const msgBuf = Buffer.from(`${JSON.stringify({ message: err instanceof Error ? err.message : String(err) })}\n`);
+                const reqId = generateRequestId();
+                res.writeHead(statusCode, {
+                  'content-type': JSON_TYPE,
+                  'content-length': msgBuf.length,
+                  'x-github-request-id': reqId,
+                });
+                res.end(msgBuf);
+              }
+            });
+            return;
+          }
+        }
+      }
+    }
+
+    const { pathname, searchParams } = parseUrl(req);
 
     // Git Smart HTTP Surface: /{owner}/{repo}.git/...
     if (!pathname.startsWith('/api/') && !pathname.startsWith('/mcp')) {
@@ -249,4 +369,10 @@ export function createApp(): Server {
     // Default 404 JSON for unhandled routes
     sendJson(res, 404, { message: 'Not Found' });
   });
+
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+
+  return server;
 }

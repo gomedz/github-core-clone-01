@@ -27,15 +27,16 @@ export const VIEWER: User = Object.freeze({
   site_admin: false,
 });
 
-let cachedTrialNow: string | undefined = process.env.MAKEFUN_TRIAL_NOW;
-let cachedUnixSec: number | undefined = cachedTrialNow ? Math.floor(new Date(cachedTrialNow).getTime() / 1000) : undefined;
+let cachedTrialNow: string | undefined = undefined;
+let cachedUnixSec: number = 0;
 
 /** Deterministic ISO timestamp derived from trial environment. */
 export function getNow(): string {
-  if (process.env.MAKEFUN_TRIAL_NOW) {
-    if (process.env.MAKEFUN_TRIAL_NOW !== cachedTrialNow) {
-      cachedTrialNow = process.env.MAKEFUN_TRIAL_NOW;
-      cachedUnixSec = Math.floor(new Date(cachedTrialNow).getTime() / 1000);
+  const trialNow = process.env.MAKEFUN_TRIAL_NOW;
+  if (trialNow) {
+    if (trialNow !== cachedTrialNow) {
+      cachedTrialNow = trialNow;
+      cachedUnixSec = Math.floor(new Date(trialNow).getTime() / 1000);
     }
     return cachedTrialNow;
   }
@@ -44,11 +45,15 @@ export function getNow(): string {
 
 /** Deterministic unix seconds for git commit headers. */
 export function getUnixSeconds(): number {
-  if (cachedUnixSec !== undefined && process.env.MAKEFUN_TRIAL_NOW === cachedTrialNow) {
+  const trialNow = process.env.MAKEFUN_TRIAL_NOW;
+  if (trialNow) {
+    if (trialNow !== cachedTrialNow) {
+      cachedTrialNow = trialNow;
+      cachedUnixSec = Math.floor(new Date(trialNow).getTime() / 1000);
+    }
     return cachedUnixSec;
   }
-  const iso = getNow();
-  return Math.floor(new Date(iso).getTime() / 1000);
+  return Math.floor(Date.now() / 1000);
 }
 
 /** Compute standard Git SHA-1 object hash: sha1("<type> <size>\0<data>"). */
@@ -454,14 +459,16 @@ export class MemoryStore {
   /** Create an issue on a repo. Enforces label existence (throws 422 if unknown). */
   public createIssue(repo: RepoRecord, author: User, title: string, body: string = '', labelNames: string[] = []): Issue {
     const resolvedLabels: Label[] = [];
-    for (const lname of labelNames) {
-      const lbl = this.getLabel(repo, lname);
-      if (!lbl) {
-        const err = new Error(`Label '${lname}' does not exist`);
-        (err as unknown as { statusCode: number }).statusCode = 422;
-        throw err;
+    if (labelNames.length > 0) {
+      for (const lname of labelNames) {
+        const lbl = this.getLabel(repo, lname);
+        if (!lbl) {
+          const err = new Error(`Label '${lname}' does not exist`);
+          (err as unknown as { statusCode: number }).statusCode = 422;
+          throw err;
+        }
+        resolvedLabels.push(lbl);
       }
-      resolvedLabels.push(lbl);
     }
 
     const issueNumber = repo.nextIssueNumber++;
@@ -473,7 +480,7 @@ export class MemoryStore {
       title,
       body,
       state: 'open',
-      user: { ...author },
+      user: author,
       labels: resolvedLabels,
       comments: 0,
       created_at: now,
